@@ -1,0 +1,39 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+
+# IDE
+.vscode/
+
+# Hadoop
+.hadoop/
+
+# Spark
+spark-warehouse/
+spark-warehouse-output/
+
+# Bosch outputs
+delta_numeric/
+delta_date/
+delta_categorical/
+
+pm_num/
+pmc_cat/
+pmc_woe/
+
+features_num/
+features_nom/
+
+path_woe/
+path_woe_test/
+
+# Data files
+*.parquet
+*.csv
+
+# Optional notebooks/cache
+.ipynb_checkpoints/
