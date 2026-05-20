@@ -1,0 +1,14 @@
+artifact_uri: file:///D:/Third_year/Term_2/Big%20Data/bosch-production-line-performance/mlruns/0/037a5d88b5fb4df49418731846326b06/artifacts
+end_time: 1779237788116
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 037a5d88b5fb4df49418731846326b06
+run_name: RandomForest
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779237761535
+status: 3
+tags: []
+user_id: huynh

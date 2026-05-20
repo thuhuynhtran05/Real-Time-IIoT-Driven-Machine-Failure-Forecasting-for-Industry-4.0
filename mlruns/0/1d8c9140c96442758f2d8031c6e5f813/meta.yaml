@@ -1,0 +1,14 @@
+artifact_uri: file:///D:/Third_year/Term_2/Big%20Data/bosch-production-line-performance/mlruns/0/1d8c9140c96442758f2d8031c6e5f813/artifacts
+end_time: 1779237857728
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 1d8c9140c96442758f2d8031c6e5f813
+run_name: CNN
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779237831013
+status: 3
+tags: []
+user_id: huynh

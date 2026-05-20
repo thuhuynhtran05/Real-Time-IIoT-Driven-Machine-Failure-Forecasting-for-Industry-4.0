@@ -1,0 +1,14 @@
+artifact_uri: file:///D:/Third_year/Term_2/Big%20Data/bosch-production-line-performance/mlruns/0/efe0561ecbca402aac41ad04e6b3805f/artifacts
+end_time: 1779236243478
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: efe0561ecbca402aac41ad04e6b3805f
+run_name: SimpleRNN
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779236237123
+status: 3
+tags: []
+user_id: huynh

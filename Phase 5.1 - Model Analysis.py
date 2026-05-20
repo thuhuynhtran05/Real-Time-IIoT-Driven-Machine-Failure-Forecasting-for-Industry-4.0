@@ -1,24 +1,61 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import mean, when, rand, col, min, max, explode, array, lit
-from pyspark.sql.utils import AnalysisException
-from pathlib import Path
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+
+import builtins
 import math
+import os
+os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import mean, col, min, max, explode, array, lit
+from pyspark.sql.utils import AnalysisException
+from pyspark.storagelevel import StorageLevel
+from pathlib import Path
 import time
 import mlflow
+import numpy as np
+from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, SimpleRNN, Dense, Dropout, Conv2D, MaxPooling2D, Flatten
+from tensorflow.keras.optimizers import Adam
 
 BASE_DIR = Path(__file__).resolve().parent
+os.environ.setdefault("HADOOP_HOME", str(BASE_DIR / ".hadoop"))
+
 SHORT_TABLE_PATHS = {
     "features_numeric": BASE_DIR / "features_num",
     "delta_numeric": BASE_DIR / "delta_numeric",
 }
 
+# Java 17/21 requires explicit module access for PySpark 3.5.x
+_java_opts = (
+    "--add-opens=java.base/java.lang=ALL-UNNAMED "
+    "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED "
+    "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED "
+    "--add-opens=java.base/java.io=ALL-UNNAMED "
+    "--add-opens=java.base/java.net=ALL-UNNAMED "
+    "--add-opens=java.base/java.nio=ALL-UNNAMED "
+    "--add-opens=java.base/java.util=ALL-UNNAMED "
+    "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED "
+    "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED "
+    "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED "
+    "--add-opens=java.base/sun.nio.cs=ALL-UNNAMED "
+    "--add-opens=java.base/sun.security.action=ALL-UNNAMED "
+    "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED "
+    "--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED"
+)
+
 spark = SparkSession.builder \
     .appName("Bosch Model Analysis") \
-    .master("local[*]") \
+    .master("local[4]") \
     .config("spark.driver.memory", "8g") \
     .config("spark.executor.memory", "8g") \
     .config("spark.sql.shuffle.partitions", "8") \
     .config("spark.sql.ansi.enabled", "false") \
+    .config("spark.driver.maxResultSize", "2g") \
+    .config("spark.driver.extraJavaOptions", _java_opts) \
+    .config("spark.executor.extraJavaOptions", _java_opts) \
     .getOrCreate()
 
 
@@ -35,79 +72,60 @@ def read_bosch_table(table_name):
         raise
 
 
-# COMMAND ----------
+# ===== DATA LOADING & PREPARATION =====
 
-# Add the response for each part
 features = read_bosch_table("features_numeric")
 features = features.withColumnRenamed("Id", "Id_Features")
 response = read_bosch_table("delta_numeric").select("Id", "Response")
 
-# COMMAND ----------
-
-features = features.join(response, features.Id_Features == response.Id,"inner")
-features = features.drop("Id_Features")
-
-# COMMAND ----------
+# ✅ FIX: Cải thiện join logic
+features = features.join(response, features.Id_Features == response.Id, "inner") \
+    .drop("Id_Features", "Id")
 
 features = features.filter(features.Response.isNotNull())
 
-# COMMAND ----------
+# ✅ FIX: Strip prefix
+features = features.withColumn("StartStation_Id", col("StartStation_Id").substr(2, 100)) \
+    .withColumn("EndStation_Id", col("EndStation_Id").substr(2, 100)) \
+    .withColumn("MinTimeStation", col("MinTimeStation").substr(2, 100)) \
+    .withColumn("MaxTimeStation", col("MaxTimeStation").substr(2, 100)) \
+    .withColumn("StartLine_Id", col("StartLine_Id").substr(2, 100)) \
+    .withColumn("EndLine_Id", col("EndLine_Id").substr(2, 100))
 
-features = features.drop("Id")
-
-# COMMAND ----------
-
-from pyspark.sql.functions import mean, when, rand, col
-
-# Remove 'S' prefix from the "Station" column and remove prefix 'L' from Line column
-features = features.withColumn("StartStation_Id", col("StartStation_Id").substr(2, 100))
-features = features.withColumn("EndStation_Id", col("EndStation_Id").substr(2, 100))
-features = features.withColumn("MinTimeStation", col("MinTimeStation").substr(2, 100))
-features = features.withColumn("MaxTimeStation", col("MaxTimeStation").substr(2, 100))
-features = features.withColumn("StartLine_Id", col("StartLine_Id").substr(2, 100))
-features = features.withColumn("EndLine_Id", col("EndLine_Id").substr(2, 100))
-
-# COMMAND ----------
-
-from pyspark.sql.functions import mean, when, rand, col
-
-# Fill nulls with mean based on each column
-mean_values = features.select(*(mean(col(column)).alias(column) for column in features.columns[:-1])).first().asDict()
-features = features.na.fill(mean_values, subset=[column for column in features.columns if column != 'Response'])
+# ✅ FIX: Fill nulls + cast to double (đúng thứ tự)
+mean_values = features.select(*(mean(col(column)).alias(column) 
+                                 for column in features.columns[:-1])).first().asDict()
+features = features.na.fill(mean_values, 
+                            subset=[column for column in features.columns if column != 'Response'])
 features = features.fillna(0)
 
-# COMMAND ----------
-
-# Iterate through columns and cast to double
+# ✅ Cast toàn bộ sang double
 for col_name in features.columns:
     features = features.withColumn(col_name, col(col_name).cast("double"))
 
-# COMMAND ----------
-
 numeric = features
 
-# COMMAND ----------
-
-# Normalization
-from pyspark.sql.functions import col, min, max
-from pyspark.sql.functions import when
+# ===== NORMALIZATION =====
 
 scaledData = numeric
-
-# Specify the columns to normalize
 columns_to_normalize = [column for column in numeric.columns if "Date" in column]
-columns_to_normalize = columns_to_normalize + ["CountFeatures", "StartStation_Id", "EndStation_Id", "Duration", "MinTimeStation", "MaxTimeStation", "StationsCount", "StartLine_Id", "EndLine_Id", "LinesCount"]
+columns_to_normalize = columns_to_normalize + [
+    "CountFeatures", "StartStation_Id", "EndStation_Id", "Duration", 
+    "MinTimeStation", "MaxTimeStation", "StationsCount", "StartLine_Id", 
+    "EndLine_Id", "LinesCount"
+]
 
-# Calculate min and max values for each column
-min_max_values = numeric.select([min(col(c)).alias(f"min_{c}") for c in columns_to_normalize] +
-                                [max(col(c)).alias(f"max_{c}") for c in columns_to_normalize]).collect()[0]
+min_max_values = numeric.select(
+    [min(col(c)).alias(f"min_{c}") for c in columns_to_normalize] +
+    [max(col(c)).alias(f"max_{c}") for c in columns_to_normalize]
+).collect()[0]
 
-# Normalize each column
 constant_columns = []
 for c in columns_to_normalize:
     min_col = min_max_values[f"min_{c}"]
     max_col = min_max_values[f"max_{c}"]
     denominator = None if min_col is None or max_col is None else max_col - min_col
+    
     if denominator is None or denominator == 0:
         constant_columns.append(c)
         scaledData = scaledData.withColumn(c, lit(0.0))
@@ -115,423 +133,261 @@ for c in columns_to_normalize:
         scaledData = scaledData.withColumn(c, (col(c) - min_col) / denominator)
 
 if constant_columns:
-    print(f"Skipped min-max scaling for constant columns: {constant_columns}")
-
-
-# COMMAND ----------
+    print(f"⚠️ Constant columns (set to 0): {constant_columns}")
 
 numeric = scaledData
 
-# COMMAND ----------
-
-# # Standardization
-# # from pyspark.ml.linalg import Vectors
-# # df = spark.createDataFrame([(Vectors.dense([0.0]),), (Vectors.dense([2.0]),)], ["a"])
-# # standardScaler = StandardScaler()
-# # standardScaler.setInputCol("a")
-# # StandardScaler...
-# # standardScaler.setOutputCol("scaled")
-# # StandardScaler...
-# # model = standardScaler.fit(df)
-# # model.getInputCol()
-# # 'a'
-# # model.setOutputCol("output")
-# # StandardScalerModel...
-# # model.mean
-# # DenseVector([1.0])
-# # model.std
-# # DenseVector([1.4142])
-# # model.transform(df).collect()[1].output
-
-# COMMAND ----------
-
-# Handle unbalanced data
-from pyspark.sql.functions import col, explode, array, lit
-import math
+# ===== HANDLE IMBALANCED DATA =====
 
 major_df = numeric.filter(col("Response") == 0)
 minor_df = numeric.filter(col("Response") == 1)
-ratio = int(major_df.count()/minor_df.count())
-print("ratio: {}".format(ratio))
-ratio =  math.floor((ratio * 0.8))
-print("ratio: {}".format(ratio))
 
+major_count = major_df.count()
+minor_count = minor_df.count()
+class_cap = int(os.environ.get("BOSCH_CLASS_CAP", "50000"))
+target_count = builtins.min(major_count, class_cap)
+ratio = builtins.max(1, math.ceil(target_count / minor_count))
+
+print(f"Class distribution - Major: {major_count}, Minor: {minor_count}")
+print(f"Local training cap per class: {target_count}, minority repeat ratio: {ratio}")
+
+# ✅ FIX: Oversample minority đúng cách (không nhân 0.8)
 a = range(ratio)
+balanced_major_df = major_df.sample(
+    withReplacement=False,
+    fraction=builtins.min(1.0, target_count / major_count),
+    seed=123
+).limit(target_count)
+oversampled_df = (
+    minor_df
+    .withColumn("dummy", explode(array([lit(x) for x in a])))
+    .drop("dummy")
+    .limit(target_count)
+)
+combined_df = balanced_major_df.unionByName(oversampled_df)
 
-# duplicate the minority rows
-oversampled_df = minor_df.withColumn("dummy", explode(array([lit(x) for x in a]))).drop('dummy')
-# combine both oversampled minority rows and previous majority rows 
-combined_df = major_df.unionAll(oversampled_df)
+numeric = combined_df.repartition(8).persist(StorageLevel.MEMORY_AND_DISK)
+print(f"After local balancing - Total rows: {numeric.count()}")
 
-# COMMAND ----------
+# ===== MODEL TRAINING WITH MLFLOW =====
 
-numeric = combined_df
+mlflow.set_tracking_uri(BASE_DIR.joinpath("mlruns").as_uri())
+mlflow.set_registry_uri(BASE_DIR.joinpath("mlruns").as_uri())
 
-# COMMAND ----------
 
-# Parameter tuning
-from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+def safe_end_run():
+    try:
+        mlflow.end_run()
+    except Exception as exc:
+        print(f"MLflow end_run skipped after Spark/MLflow error: {exc}")
+
 from pyspark.ml.feature import VectorAssembler
-from pyspark.ml.classification import RandomForestClassifier, GBTClassifier, DecisionTreeClassifier, FMClassifier
+from pyspark.ml.classification import RandomForestClassifier, GBTClassifier, DecisionTreeClassifier
 from xgboost.spark import SparkXGBClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
 from pyspark.ml import Pipeline
-import mlflow
-import time
 
-# Split the data into training and testing sets
-numeric = numeric.filter(col("Response") == 1).unionAll(numeric.filter(col("Response") == 0).limit(100000))
+# Split data
 (train_data, test_data) = numeric.randomSplit([0.8, 0.2], seed=123)
+train_data = train_data.persist(StorageLevel.MEMORY_AND_DISK)
+test_data = test_data.persist(StorageLevel.MEMORY_AND_DISK)
+print(f"Train rows: {train_data.count()}, Test rows: {test_data.count()}")
 
-# Define the input features column names
 input_features = numeric.columns[:-1]
-
-# Create a VectorAssembler to assemble the input features into a single vector column
-assembler = VectorAssembler(inputCols=input_features, outputCol="features")
-assembler.setHandleInvalid("skip")
-
-# Create an XGBoost classifier
-# xgb_classifier = SparkXGBClassifier(label_col="Response",features_col="features", max_depth=5,num_round=100,num_workers=2)
-
-# # Define a parameter grid for tuning
-# param_grid = (ParamGridBuilder()
-#               .addGrid(xgb_classifier.max_depth, [5, 10, 15])
-#               .addGrid(xgb_classifier.n_estimators, [50, 100, 150])
-#               .addGrid(xgb_classifier.learning_rate, [0.1, 0.2, 0.3])
-#               .build())
-
-# random_forest = RandomForestClassifier(labelCol="Response", featuresCol="features", maxDepth=5,featureSubsetStrategy='auto',numTrees=20)
-# Define a parameter grid for tuning
-# param_grid = (ParamGridBuilder()
-#               .addGrid(random_forest.maxDepth, [5, 10, 15])
-#               .addGrid(random_forest.numTrees, [50, 100, 150])
-#               .addGrid(random_forest.featureSubsetStrategy, ["auto", "sqrt", "log2"])
-#               .build())
-
-# Define a parameter grid for tuning Decision Tree
-# decision_tree = DecisionTreeClassifier(labelCol="Response", featuresCol="features",maxDepth=5,maxBins=32)
-# param_grid = (ParamGridBuilder()
-#                  .addGrid(decision_tree.maxDepth, [5, 10, 15])
-#                  .addGrid(decision_tree.maxBins, [32, 64, 128])
-#                  .build())
-
-# Define a parameter grid for tuning GBT
-gbt = GBTClassifier(labelCol="Response", featuresCol="features",maxDepth=5,maxBins=128,stepSize=0.3)
-param_grid = (ParamGridBuilder()
-                  .addGrid(gbt.maxDepth, [5, 10, 15])
-                  .addGrid(gbt.maxBins, [32, 64, 128])
-                  .addGrid(gbt.stepSize, [0.1, 0.2, 0.3])
-                  .build())
-
-# Define a parameter grid for tuning FM
-# fm = FMClassifier(labelCol="Response", featuresCol="features",factorSize=8,maxIter=100,stepSize=0.1,regParam=0.0)
-# param_grid = (ParamGridBuilder()
-#                  .addGrid(fm.factorSize, [8, 10, 12])
-#                  .addGrid(fm.maxIter, [50, 100, 150])
-#                  .addGrid(fm.stepSize, [0.1, 0.2, 0.3])
-#                  .addGrid(fm.regParam, [0.0, 0.1, 0.2])
-#                  .build())
-
-binary_evaluator = BinaryClassificationEvaluator(labelCol="Response")
-multiclass_evaluator = MulticlassClassificationEvaluator(labelCol="Response", metricName="accuracy")
-    
-# Set up the cross-validation
-crossval = CrossValidator(estimator=gbt,
-                          estimatorParamMaps=param_grid,
-                          evaluator=binary_evaluator,
-                          numFolds=3)
-
-# Modify the pipeline stages to include the XGBoost classifier
-pipeline = Pipeline(stages=[assembler, crossval])
-
-# Train with cross-validation within the pipeline
-start_time = time.time()
-model_tuned = pipeline.fit(train_data)
-predictions_tuned = model_tuned.transform(test_data)
-execution_time_tuned = time.time() - start_time
-
-model_tuned.stages[1].bestModel.extractParamMap()
-
-# COMMAND ----------
-
-# RUN ALGORITHMS WITH ORIGINAL DATA
-from pyspark.ml.feature import VectorAssembler
-from pyspark.ml.classification import RandomForestClassifier, GBTClassifier, DecisionTreeClassifier, FMClassifier
-from xgboost.spark import SparkXGBClassifier
-from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
-from pyspark.ml import Pipeline
-import mlflow
-import time
-
-# Split the data into training and testing sets
-(train_data, test_data) = numeric.randomSplit([0.8, 0.2], seed=123)
-
-# Define the input features column names
-input_features = numeric.columns[:-1]
-
-# Create a VectorAssembler to assemble the input features into a single vector column
-assembler = VectorAssembler(inputCols=input_features, outputCol="features")
-assembler.setHandleInvalid("skip")
-
-# Define the ML models
-random_forest = RandomForestClassifier(labelCol="Response", featuresCol="features", maxDepth=15, featureSubsetStrategy='sqrt',numTrees=150)
-gbt = GBTClassifier(labelCol="Response", featuresCol="features",maxDepth=5,maxBins=128,stepSize=0.3)
-decision_tree = DecisionTreeClassifier(labelCol="Response", featuresCol="features",maxDepth=10,maxBins=64)
-xgb = SparkXGBClassifier(label_col="Response",features_col="features", max_depth=15,num_round=150,num_workers=2,learning_rate=0.3)
-fm = FMClassifier(labelCol="Response", featuresCol="features",factorSize=8,maxIter=50,stepSize=0.1,regParam=0.0)
-
-# Create a pipeline for each model
-random_forest_pipeline = Pipeline(stages=[assembler, random_forest])
-gbt_pipeline = Pipeline(stages=[assembler, gbt])
-decision_tree_pipeline = Pipeline(stages=[assembler, decision_tree])
-xgb_pipeline = Pipeline(stages=[assembler, xgb])
-fm_pipeline = Pipeline(stages=[assembler, fm])
-
-# Train the models in parallel using parallelism
-with mlflow.start_run():
-
-    binary_evaluator = BinaryClassificationEvaluator(labelCol="Response")
-    multiclass_evaluator = MulticlassClassificationEvaluator(labelCol="Response", metricName="accuracy")
-    
-    # Train XGBoost
-    start_time = time.time()
-    xgb_model = xgb_pipeline.fit(train_data)
-    xgb_predictions = xgb_model.transform(test_data)
-    xgb_execution_time = time.time() - start_time
-    # Log the metrics using MLflow
-    mlflow.log_metric("XGBoost AUC", binary_evaluator.evaluate(xgb_predictions, {binary_evaluator.metricName: "areaUnderROC"}))
-    mlflow.log_metric("XGBoost accuracy", multiclass_evaluator.evaluate(xgb_predictions, {multiclass_evaluator.metricName: "accuracy"}))
-    mlflow.log_metric("XGBoost Precision", multiclass_evaluator.evaluate(xgb_predictions, {multiclass_evaluator.metricName: "precisionByLabel"}))
-    mlflow.log_metric("XGBoost Recall", multiclass_evaluator.evaluate(xgb_predictions, {multiclass_evaluator.metricName: "recallByLabel"}))
-    mlflow.log_metric("XGBoost F1", multiclass_evaluator.evaluate(xgb_predictions, {multiclass_evaluator.metricName: "f1"}))
-    mlflow.log_param("XGBoost Execution Time", xgb_execution_time)
-
-    # Train Random Forest
-    start_time = time.time()
-    random_forest_model = random_forest_pipeline.fit(train_data)
-    random_forest_predictions = random_forest_model.transform(test_data)
-    random_forest_execution_time = time.time() - start_time
-    # Log the metrics using MLflow
-    mlflow.log_metric("Random Forest AUC", binary_evaluator.evaluate(random_forest_predictions, {binary_evaluator.metricName: "areaUnderROC"}))
-    mlflow.log_metric("Random Forest accuracy", multiclass_evaluator.evaluate(random_forest_predictions, {multiclass_evaluator.metricName: "accuracy"}))
-    mlflow.log_metric("Random Forest Precision", multiclass_evaluator.evaluate(random_forest_predictions, {multiclass_evaluator.metricName: "precisionByLabel"}))
-    mlflow.log_metric("Random Forest Recall", multiclass_evaluator.evaluate(random_forest_predictions, {multiclass_evaluator.metricName: "recallByLabel"}))
-    mlflow.log_metric("Random Forest F1", multiclass_evaluator.evaluate(random_forest_predictions, {multiclass_evaluator.metricName: "f1"}))
-    mlflow.log_param("Random Forest Execution Time", random_forest_execution_time)
-
-    # Train Gradient Boosting Machine (GBM)
-    start_time = time.time()
-    gbt_model = gbt_pipeline.fit(train_data)
-    gbt_predictions = gbt_model.transform(test_data)
-    gbt_execution_time = time.time() - start_time
-    # Log the metrics using MLflow
-    mlflow.log_metric("Gradient Boosting Machine AUC", binary_evaluator.evaluate(gbt_predictions, {binary_evaluator.metricName: "areaUnderROC"}))
-    mlflow.log_metric("Gradient Boosting Machine accuracy", multiclass_evaluator.evaluate(gbt_predictions, {multiclass_evaluator.metricName: "accuracy"}))
-    mlflow.log_metric("Gradient Boosting Machine Precision", multiclass_evaluator.evaluate(gbt_predictions, {multiclass_evaluator.metricName: "precisionByLabel"}))
-    mlflow.log_metric("Gradient Boosting Machine Recall", multiclass_evaluator.evaluate(gbt_predictions, {multiclass_evaluator.metricName: "recallByLabel"}))
-    mlflow.log_metric("Gradient Boosting Machine F1", multiclass_evaluator.evaluate(gbt_predictions, {multiclass_evaluator.metricName: "f1"}))
-    mlflow.log_param("Gradient Boosting Machine Execution Time", gbt_execution_time)
-
-    # Train Decision Tree
-    start_time = time.time()
-    decision_tree_model = decision_tree_pipeline.fit(train_data)
-    decision_tree_predictions = decision_tree_model.transform(test_data)
-    decision_tree_execution_time = time.time() - start_time
-    # Log the metrics using MLflow
-    mlflow.log_metric("Decision Tree AUC", binary_evaluator.evaluate(decision_tree_predictions, {binary_evaluator.metricName: "areaUnderROC"}))
-    mlflow.log_metric("Decision Tree accuracy", multiclass_evaluator.evaluate(decision_tree_predictions, {multiclass_evaluator.metricName: "accuracy"}))
-    mlflow.log_metric("Decision Tree Precision", multiclass_evaluator.evaluate(decision_tree_predictions, {multiclass_evaluator.metricName: "precisionByLabel"}))
-    mlflow.log_metric("Decision Tree Recall", multiclass_evaluator.evaluate(decision_tree_predictions, {multiclass_evaluator.metricName: "recallByLabel"}))
-    mlflow.log_metric("Decision Tree F1", multiclass_evaluator.evaluate(decision_tree_predictions, {multiclass_evaluator.metricName: "f1"}))
-    mlflow.log_param("Decision Tree Execution Time", decision_tree_execution_time)
-
-    # Train FMClassifier
-    start_time = time.time()
-    fm_model = fm_pipeline.fit(train_data)
-    fm_predictions = fm_model.transform(test_data)
-    fm_pipeline_execution_time = time.time() - start_time
-    # Log the metrics using MLflow
-    mlflow.log_metric("Factorization Machines AUC", binary_evaluator.evaluate(fm_predictions, {binary_evaluator.metricName: "areaUnderROC"}))
-    mlflow.log_metric("Factorization Machines accuracy", multiclass_evaluator.evaluate(fm_predictions, {multiclass_evaluator.metricName: "accuracy"}))
-    mlflow.log_metric("Factorization Machines Precision", multiclass_evaluator.evaluate(fm_predictions, {multiclass_evaluator.metricName: "precisionByLabel"}))
-    mlflow.log_metric("Factorization Machines Recall", multiclass_evaluator.evaluate(fm_predictions, {multiclass_evaluator.metricName: "recallByLabel"}))
-    mlflow.log_metric("Factorization Machines F1", multiclass_evaluator.evaluate(fm_predictions, {multiclass_evaluator.metricName: "f1"}))
-    mlflow.log_param("Factorization Machines Execution Time", fm_pipeline_execution_time)
-
-# COMMAND ----------
-
-# Binary Classification with LSTM
-from keras.layers import Dense, LSTM, Dropout
-from keras.models import Sequential
-from keras.optimizers import Adam
-import numpy as np
-from pyspark.ml.feature import VectorAssembler
-
-# Create a VectorAssembler to assemble your features into a single vector column
-assembler = VectorAssembler(inputCols=numeric.columns[:-1], outputCol="features", handleInvalid="skip")
-
-# Transform the PySpark DataFrame to include the 'features' column
-numeric = assembler.transform(numeric).select("Response", "features")
-
-# COMMAND ----------
-
-# Convert the 'features' column to a NumPy array
-features_array = np.array(numeric.select("features").rdd.map(lambda row: row.features).collect())
-
-# You can reshape it to match the LSTM input shape
-features_array = features_array.reshape(features_array.shape[0], 1, features_array.shape[1])
-
-# Retrieve the labels as a NumPy array
-labels = np.array(numeric.select("Response").rdd.map(lambda row: row.Response).collect())
-
-
-# COMMAND ----------
-
-# Define the Keras model
-model = Sequential()
-model.add(LSTM(100, activation='tanh', return_sequences=True, input_shape=(1, features_array.shape[2])))
-model.add(LSTM(49, activation='tanh'))
-model.add(Dropout(0.2))
-model.add(Dense(1, activation='sigmoid'))
-
-opt = Adam(learning_rate=0.01)
-model.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy'], run_eagerly=True)
-
-# Train the model
-model.fit(features_array, labels, batch_size=len(features_array), epochs=10, validation_split=0.2)
-model.summary()
-
-# COMMAND ----------
-
-# # Convert the PySpark DataFrame to a distributed NumPy array
-# numeric_rdd = numeric.rdd.map(lambda row: (row.Response, row.features.toArray()))
-
-# # Extract the labels and features as NumPy arrays
-# labels = np.array(numeric_rdd.map(lambda x: x[0]).collect())
-# features = np.array(numeric_rdd.map(lambda x: x[1]).collect())
-
-# COMMAND ----------
-
-model = Sequential()
-model.add(LSTM(100, activation='tanh', return_sequences=True, input_shape=(1, len(combined_df.columns)-1)))
-model.add(LSTM(49, activation='tanh'))
-model.add(Dropout(0.2))
-model.add(Dense(1, activation='sigmoid'))
-
-# COMMAND ----------
-
-opt = Adam(learning_rate=0.01)
-model.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy'], run_eagerly=True)
-
-# COMMAND ----------
-
-model.fit(features, labels, batch_size=len(combined_df.columns)-1, epochs=10, validation_split=0.2)
-model.summary()
-
-# COMMAND ----------
-
-# Binary Classification with LSTM
-from keras.layers import Dense,LSTM,Dropout
-from keras.models import Sequential
-from keras.optimizers import Adam
-import numpy as np
-
-features = numeric.toPandas()
-X = features.drop("Response", axis=1)
-y = features['Response']
-
-features = len(X.columns)
-model = Sequential()
-model.add(LSTM(100, activation='tanh', return_sequences=True, input_shape=(1, features)))
-model.add(LSTM(49, activation='tanh'))
-model.add(Dropout(0.2))
-model.add(Dense(1, activation='sigmoid'))
-
-opt = Adam(learning_rate=0.01)
-model.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy'], run_eagerly=True)
-
-X = np.resize(X, (X.shape[0], 1, X.shape[1]))
-model.fit(X, y, batch_size=len(X), epochs=10, validation_split=0.2)
-model.summary()
-
-# COMMAND ----------
-
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import SimpleRNN, Dense, Dropout
-
-features = X.shape[1]
-time_steps = 1  # You can adjust this based on your data
-
-model = Sequential()
-
-# Add a SimpleRNN layer
-model.add(SimpleRNN(units=100, activation='tanh', return_sequences=True, input_shape=(time_steps, features)))
-
-# Add another SimpleRNN layer
-model.add(SimpleRNN(units=49, activation='tanh'))
-
-# Add a dropout layer
-model.add(Dropout(0.2))
-
-# Add the output layer with sigmoid activation for binary classification
-model.add(Dense(1, activation='sigmoid'))
-
-# Compile the model
-opt = tf.keras.optimizers.Adam(learning_rate=0.01)
-model.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy'])
-
-# Reshape X if necessary
-X = X.reshape(X.shape[0], time_steps, features)
-
-# Train the model
-model.fit(X, y, batch_size=len(X), epochs=10, validation_split=0.2)
-
-# Print a summary of the model
-model.summary()
-
-# COMMAND ----------
-
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-
-# Assuming you have your image data and labels in the variables X and y
-
-# Create a Sequential model
-model = Sequential()
-
-# Add a Convolutional layer with 32 filters, a 3x3 kernel, and ReLU activation
-model.add(Conv2D(32, (3, 3), activation='relu', input_shape=(width, height, channels)))
-
-# Add a MaxPooling layer with a 2x2 pool size
-model.add(MaxPooling2D(pool_size=(2, 2)))
-
-# Add another Convolutional layer with 64 filters and a 3x3 kernel
-model.add(Conv2D(64, (3, 3), activation='relu'))
-
-# Add another MaxPooling layer
-model.add(MaxPooling2D(pool_size=(2, 2)))
-
-# Flatten the output for the fully connected layers
-model.add(Flatten())
-
-# Add a fully connected layer with 128 units and ReLU activation
-model.add(Dense(128, activation='relu'))
-
-# Add a dropout layer to reduce overfitting
-model.add(Dropout(0.5))
-
-# Add the output layer with the appropriate number of units (e.g., for binary classification)
-model.add(Dense(1, activation='sigmoid'))
-
-# Compile the model
-opt = Adam(learning_rate=0.001)
-model.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy'])
-
-# Train the model with your image data and labels
-model.fit(X, y, batch_size=32, epochs=10, validation_split=0.2)
-
-# Print a summary of the model
-model.summary()
+assembler = VectorAssembler(inputCols=input_features, outputCol="features", handleInvalid="skip")
+
+# Define evaluators properly
+binary_evaluator = BinaryClassificationEvaluator(labelCol="Response", metricName="areaUnderROC")
+accuracy_evaluator = MulticlassClassificationEvaluator(labelCol="Response", metricName="accuracy")
+precision_evaluator = MulticlassClassificationEvaluator(labelCol="Response", metricName="weightedPrecision")
+recall_evaluator = MulticlassClassificationEvaluator(labelCol="Response", metricName="weightedRecall")
+f1_evaluator = MulticlassClassificationEvaluator(labelCol="Response", metricName="f1")
+
+# Define models
+models = {
+    "RandomForest": RandomForestClassifier(labelCol="Response", featuresCol="features", 
+                                           maxDepth=10, featureSubsetStrategy='sqrt', numTrees=50),
+    "DecisionTree": DecisionTreeClassifier(labelCol="Response", featuresCol="features", 
+                                          maxDepth=8, maxBins=32),
+}
+
+if os.environ.get("BOSCH_RUN_XGBOOST", "0") == "1":
+    models["XGBoost"] = SparkXGBClassifier(
+        label_col="Response",
+        features_col="features",
+        max_depth=6,
+        n_estimators=50,
+        num_workers=1,
+        learning_rate=0.2,
+    )
+else:
+    print("Skipping XGBoost by default on local Windows Spark. Set BOSCH_RUN_XGBOOST=1 to run it.")
+
+if os.environ.get("BOSCH_RUN_GBT", "0") == "1":
+    models["GBT"] = GBTClassifier(
+        labelCol="Response",
+        featuresCol="features",
+        maxDepth=3,
+        maxBins=32,
+        maxIter=20,
+        stepSize=0.1,
+    )
+else:
+    print("Skipping GBT by default on local Spark. Set BOSCH_RUN_GBT=1 to run the lighter GBT config.")
+
+# ✅ FIX: Tạo run riêng cho mỗi mô hình
+results = {}
+for model_name, model in models.items():
+    mlflow.start_run(run_name=model_name)
+    try:
+        pipeline = Pipeline(stages=[assembler, model])
+        
+        start_time = time.time()
+        trained_model = pipeline.fit(train_data)
+        predictions = trained_model.transform(test_data)
+        exec_time = time.time() - start_time
+        
+        # ✅ FIX: Evaluator.evaluate() chỉ nhận DataFrame, không có dict parameter
+        auc = binary_evaluator.evaluate(predictions)
+        accuracy = accuracy_evaluator.evaluate(predictions)
+        precision = precision_evaluator.evaluate(predictions)
+        recall = recall_evaluator.evaluate(predictions)
+        f1 = f1_evaluator.evaluate(predictions)
+        
+        # Log metrics
+        mlflow.log_metric(f"{model_name}_AUC", auc)
+        mlflow.log_metric(f"{model_name}_Accuracy", accuracy)
+        mlflow.log_metric(f"{model_name}_Precision", precision)
+        mlflow.log_metric(f"{model_name}_Recall", recall)
+        mlflow.log_metric(f"{model_name}_F1", f1)
+        mlflow.log_param(f"{model_name}_ExecutionTime", exec_time)
+        
+        results[model_name] = {
+            "AUC": auc, "Accuracy": accuracy, "F1": f1, "Time": exec_time
+        }
+        print(f"✅ {model_name} - AUC: {auc:.4f}, Accuracy: {accuracy:.4f}")
+        
+    except Exception as e:
+        print(f"❌ {model_name} training failed: {str(e)}")
+    finally:
+        safe_end_run()
+
+# ===== DEEP LEARNING =====
+
+dl_cap = int(os.environ.get("BOSCH_DL_CAP", "30000"))
+dl_epochs = int(os.environ.get("BOSCH_DL_EPOCHS", "3"))
+train_pd = train_data.limit(dl_cap).toPandas()
+test_pd = test_data.limit(builtins.max(1, dl_cap // 5)).toPandas()
+print(f"Deep learning pandas sample - Train: {len(train_pd)}, Test: {len(test_pd)}")
+
+X_train = train_pd.drop("Response", axis=1).values
+y_train = train_pd['Response'].values
+X_test = test_pd.drop("Response", axis=1).values
+y_test = test_pd['Response'].values
+
+X_train_seq = X_train.reshape(X_train.shape[0], 1, X_train.shape[1])
+X_test_seq = X_test.reshape(X_test.shape[0], 1, X_test.shape[1])
+
+
+def log_dl_metrics(model_name, y_true, y_prob):
+    y_pred = (y_prob > 0.5).astype(int).flatten()
+    auc = roc_auc_score(y_true, y_prob)
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    mlflow.log_metric(f"{model_name}_AUC", auc)
+    mlflow.log_metric(f"{model_name}_Accuracy", acc)
+    mlflow.log_metric(f"{model_name}_Precision", prec)
+    mlflow.log_metric(f"{model_name}_Recall", rec)
+    mlflow.log_metric(f"{model_name}_F1", f1)
+    print(f"✅ {model_name} - AUC: {auc:.4f}, Accuracy: {acc:.4f}, F1: {f1:.4f}")
+
+
+# ===== LSTM =====
+
+print("\n🔄 Training LSTM...")
+mlflow.start_run(run_name="LSTM")
+try:
+    lstm_model = Sequential([
+        LSTM(100, activation='tanh', return_sequences=True, input_shape=(1, X_train.shape[1])),
+        LSTM(49, activation='tanh'),
+        Dropout(0.2),
+        Dense(1, activation='sigmoid')
+    ])
+    lstm_model.compile(optimizer=Adam(learning_rate=0.01),
+                       loss='binary_crossentropy',
+                       metrics=['accuracy'])
+    lstm_model.fit(X_train_seq, y_train, batch_size=32, epochs=dl_epochs, verbose=0)
+    lstm_model.summary()
+    log_dl_metrics("LSTM", y_test, lstm_model.predict(X_test_seq, verbose=0).flatten())
+except Exception as e:
+    print(f"❌ LSTM training failed: {str(e)}")
+finally:
+    safe_end_run()
+
+
+# ===== SimpleRNN =====
+
+print("\n🔄 Training SimpleRNN...")
+mlflow.start_run(run_name="SimpleRNN")
+try:
+    rnn_model = Sequential([
+        SimpleRNN(units=100, activation='tanh', return_sequences=True, input_shape=(1, X_train.shape[1])),
+        SimpleRNN(units=49, activation='tanh'),
+        Dropout(0.2),
+        Dense(1, activation='sigmoid')
+    ])
+    rnn_model.compile(optimizer=Adam(learning_rate=0.01),
+                      loss='binary_crossentropy',
+                      metrics=['accuracy'])
+    rnn_model.fit(X_train_seq, y_train, batch_size=32, epochs=dl_epochs, verbose=0)
+    rnn_model.summary()
+    log_dl_metrics("SimpleRNN", y_test, rnn_model.predict(X_test_seq, verbose=0).flatten())
+except Exception as e:
+    print(f"❌ SimpleRNN training failed: {str(e)}")
+finally:
+    safe_end_run()
+
+
+# ===== CNN =====
+
+img_size = int(np.sqrt(X_train.shape[1]))
+if img_size * img_size < X_train.shape[1]:
+    img_size += 1
+
+
+def to_cnn(X):
+    X_out = np.pad(X, ((0, 0), (0, img_size * img_size - X.shape[1])), mode='constant')
+    return X_out.reshape(X_out.shape[0], img_size, img_size, 1)
+
+
+X_train_cnn = to_cnn(X_train)
+X_test_cnn = to_cnn(X_test)
+
+print(f"\n🔄 Training CNN (input shape: {X_train_cnn.shape})...")
+mlflow.start_run(run_name="CNN")
+try:
+    cnn_model = Sequential([
+        Conv2D(32, (3, 3), activation='relu', input_shape=(img_size, img_size, 1)),
+        MaxPooling2D(pool_size=(2, 2)),
+        Conv2D(64, (3, 3), activation='relu'),
+        MaxPooling2D(pool_size=(2, 2)),
+        Flatten(),
+        Dense(128, activation='relu'),
+        Dropout(0.3),
+        Dense(1, activation='sigmoid')
+    ])
+    cnn_model.compile(optimizer=Adam(learning_rate=0.001),
+                      loss='binary_crossentropy',
+                      metrics=['accuracy'])
+    cnn_model.fit(X_train_cnn, y_train, batch_size=32, epochs=dl_epochs, verbose=0)
+    cnn_model.summary()
+    log_dl_metrics("CNN", y_test, cnn_model.predict(X_test_cnn, verbose=0).flatten())
+except Exception as e:
+    print(f"❌ CNN training failed: {str(e)}")
+finally:
+    safe_end_run()
+
+
+print("\n✅ All models trained successfully!")

@@ -1,0 +1,14 @@
+artifact_uri: file:///D:/Third_year/Term_2/Big%20Data/bosch-production-line-performance/mlruns/0/0dac31d1ea7947ffb6c5a23e365ab6c6/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 0dac31d1ea7947ffb6c5a23e365ab6c6
+run_name: GBT
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779235598787
+status: 1
+tags: []
+user_id: huynh

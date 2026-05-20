@@ -1,0 +1,14 @@
+artifact_uri: file:///D:/Third_year/Term_2/Big%20Data/bosch-production-line-performance/mlruns/0/c06423ef14d94e459a01d3dfc31d276a/artifacts
+end_time: 1779236237091
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: c06423ef14d94e459a01d3dfc31d276a
+run_name: LSTM
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779236228748
+status: 3
+tags: []
+user_id: huynh

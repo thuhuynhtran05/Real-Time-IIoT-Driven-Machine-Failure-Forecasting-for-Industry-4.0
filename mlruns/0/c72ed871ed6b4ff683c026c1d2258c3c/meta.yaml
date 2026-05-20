@@ -1,0 +1,14 @@
+artifact_uri: file:///D:/Third_year/Term_2/Big%20Data/bosch-production-line-performance/mlruns/0/c72ed871ed6b4ff683c026c1d2258c3c/artifacts
+end_time: 1779236226032
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: c72ed871ed6b4ff683c026c1d2258c3c
+run_name: XGBoost
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779236208067
+status: 3
+tags: []
+user_id: huynh
