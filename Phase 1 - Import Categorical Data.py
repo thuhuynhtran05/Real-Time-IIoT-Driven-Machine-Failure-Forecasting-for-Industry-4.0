@@ -1,6 +1,5 @@
 # Databricks notebook source
 from pathlib import Path
-import time
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col
@@ -51,19 +50,12 @@ df_complete = df_complete.select(
 
 db = "bosch"
 permanent_table_name = "categorical"
-table_path = (
-    WAREHOUSE_DIR
-    / f"{db}.db"
-    / f"{permanent_table_name}_runs"
-    / f"{permanent_table_name}_{int(time.time())}"
-)
+table_path = WAREHOUSE_DIR / f"{db}.db" / permanent_table_name
 
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {db}")
 spark.sql(f"DROP TABLE IF EXISTS {db}.{permanent_table_name}")
-spark.catalog.clearCache()
 
 print(f"Writing table: {db}.{permanent_table_name}", flush=True)
-print(f"Table location: {table_path}", flush=True)
 
 df_complete.write.format("parquet").mode("overwrite").option(
     "path", str(table_path)
@@ -72,3 +64,6 @@ df_complete.write.format("parquet").mode("overwrite").option(
 )
 
 print(f"Saved table: {db}.{permanent_table_name}", flush=True)
+categorical = spark.read.table("bosch.delta_categorical")
+print(categorical.count())  # ← Số rows thực tế
+print(len(categorical.columns))  # ← Số columns thực tế
